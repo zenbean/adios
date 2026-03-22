@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="SpotifyMuter.vcxproj" Id="d3e3d839-b22f-4ec2-a70b-c2c91209360e" />
+</Solution>

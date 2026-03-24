@@ -5,12 +5,24 @@
 #include <iostream> 
 #include <vector>
 #include <string>
+#include <thread>
+#include <atomic>
+#include <shellapi.h> // system tray
+#include "resource.h"
+
+#define WM_TRAYICON (WM_USER+1)
+#define ID_TRAY_EXIT 1001
+
+NOTIFYICONDATA notifyIconData = {};
+
+// global flag controls infinite loop
+std::atomic<bool> g_IsRunning = true;
 
 void SetSpotifyMute(bool muteSpotify);
 
 struct TargetWindow {
-	HWND hwnd; // window handle
-	std::wstring title; // wide string type
+    HWND hwnd; // window handle
+    std::wstring title; // wide string type
 };
 
 bool IsPlayingAd(const std::wstring& title) {
@@ -36,6 +48,7 @@ bool IsPlayingAd(const std::wstring& title) {
 
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     if (!IsWindowVisible(hwnd)) return TRUE;
+    if (GetWindow(hwnd, GW_OWNER) != NULL) return TRUE;
 
     // get dynamic PID of window
     DWORD processID;
@@ -64,15 +77,6 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
 
                 // ignore spotify invisible helper windows
                 if (title != L"Default IME" && title != L"MSCTFIME UI") {
-                    if (IsPlayingAd(title)) {
-                        OutputDebugStringW((L"[TRIGGER MUTE] Ad detected: " + title + L"\n").c_str());
-                        SetSpotifyMute(true);
-                    }
-                    else {
-                        OutputDebugStringW((L"[UNMUTE] Song playing: " + title + L"\n").c_str());
-                        SetSpotifyMute(false);
-                    }
-
                     auto* foundWindows = reinterpret_cast<std::vector<TargetWindow>*>(lParam);
                     foundWindows->push_back({ hwnd, title });
                     return FALSE;
@@ -153,36 +157,109 @@ void SetSpotifyMute(bool muteSpotify) {
     pEnumerator->Release();
 }
 
+void SpotifyMonitorThread() {
+    // Initialize COM for background thread
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    while (g_IsRunning) {
+        std::vector<TargetWindow> found;
+        EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&found));
+
+        if (!found.empty()) {
+            std::wstring currentTitle = found[0].title;
+            std::wstring msg = L"[TITLE] " + currentTitle + L"\n";
+            OutputDebugStringW(msg.c_str());
+            if (IsPlayingAd(currentTitle)) {
+                OutputDebugStringW(L"[ACTION] Ad detected! Muting...\n");
+                SetSpotifyMute(true);
+            }
+            else {
+                OutputDebugStringW(L"[ACTION] Song detected. Unmuting...\n");
+                SetSpotifyMute(false);
+            }
+            Sleep(500);
+        }
+        else {
+            Sleep(5000);
+        }
+    }
+    CoUninitialize();
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_TRAYICON:
+        // right click?
+        if (lParam == WM_RBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt); // get mouse coords
+            HMENU hMenu = CreatePopupMenu();
+            InsertMenuW(hMenu, -1, MF_BYPOSITION | MF_STRING, ID_TRAY_EXIT, L"Exit Spotify Muter");
+            SetForegroundWindow(hwnd);
+            TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(hMenu);
+        }
+        break;
+    case WM_COMMAND:
+        // lick exit?
+        if (LOWORD(wParam) == ID_TRAY_EXIT) {
+            g_IsRunning = false; // Kill the background audio thread
+            PostQuitMessage(0);  // Kill the main window loop
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow)
 {
-    // turn on COM - for WASAPI
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-	// 1. Create the System Tray Icon here...
+    // background polling thread
+    std::thread monitorThread(SpotifyMonitorThread);
 
-	// 2. Start the Infinite Loop
-    while (true) {
-        // EMERGENCY EXIT: Hold the Escape key to close the program
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            break;
-        }
-		// Find Spotify
-		std::vector<TargetWindow> found;
-		EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&found));
+    const wchar_t CLASS_NAME[] = L"SpotifyMuterHiddenClass";
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    RegisterClassW(&wc);
 
-		if (!found.empty()) {
-			// For now, let's just show a popup with the first one we found
-			std::wstring msg = L"Found Spotify! Current Title: " + found[0].title;
-			MessageBoxW(NULL, msg.c_str(), L"Detector", MB_OK);
-		}
-		else {
-			MessageBoxW(NULL, L"Spotify not found. Is it open?", L"Detector", MB_OK);
-		}
-		// Check if it's playing an ad
-		// Mute/Unmute
+    HWND hwnd = CreateWindowExW(
+        0, CLASS_NAME, L"Spotify Muter Controller",
+        WS_OVERLAPPEDWINDOW,
+        0, 0, 0, 0,
+        HWND_MESSAGE,
+        NULL, hInstance, NULL
+    );
 
-		Sleep(500); // Wait half a second so we don't cook the CPU
-	}
-    // turn off COM
-    CoUninitialize();
-	return 0;
+    notifyIconData.cbSize = sizeof(NOTIFYICONDATAW);
+    notifyIconData.hWnd = hwnd;
+    notifyIconData.uID = 1;
+    notifyIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    notifyIconData.uCallbackMessage = WM_TRAYICON;
+    notifyIconData.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
+    wcscpy_s(notifyIconData.szTip, L"Spotify Ad Muter (Running)");
+
+    Shell_NotifyIconW(NIM_ADD, &notifyIconData);
+
+    // for tray icon
+    MSG msg = { };
+
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    Shell_NotifyIconW(NIM_DELETE, &notifyIconData);
+
+    g_IsRunning = false;
+
+    // wait for the background thread to finish 
+    if (monitorThread.joinable()) {
+        monitorThread.join();
+    }
+
+    return 0;
 }
